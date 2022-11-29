@@ -18,8 +18,11 @@ import xbmcvfs
 SCRIPT_ID = "script.module.autocompletion"
 SCRIPT_ADDON = xbmcaddon.Addon(SCRIPT_ID)
 PLUGIN_ID = "plugin.program.autocompletion"
-PLUGIN_ADDON = xbmcaddon.Addon(PLUGIN_ID)
-SETTING = PLUGIN_ADDON.getSetting
+try:
+    PLUGIN_ADDON = xbmcaddon.Addon(PLUGIN_ID)
+    SETTING = PLUGIN_ADDON.getSetting
+except RuntimeError:
+    SETTING = SCRIPT_ADDON.getSetting
 ADDON_PATH = xbmcvfs.translatePath(SCRIPT_ADDON.getAddonInfo("path"))
 ADDON_ID = SCRIPT_ADDON.getAddonInfo("id")
 ADDON_DATA_PATH = xbmcvfs.translatePath(SCRIPT_ADDON.getAddonInfo("profile"))
