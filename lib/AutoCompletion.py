@@ -6,6 +6,8 @@
 from abc import ABC, abstractmethod
 from urllib.parse import quote_plus
 import os
+import re
+import sqlite3
 import time
 import hashlib
 import requests
@@ -13,6 +15,7 @@ import json
 
 import xbmc
 import xbmcaddon
+import xbmcgui
 import xbmcvfs
 
 SCRIPT_ID = "script.module.autocompletion"
@@ -25,16 +28,25 @@ ADDON_ID = SCRIPT_ADDON.getAddonInfo("id")
 ADDON_DATA_PATH = xbmcvfs.translatePath(SCRIPT_ADDON.getAddonInfo("profile"))
 
 
-def get_autocomplete_items(search_str, limit=10, provider=None):
+def get_autocomplete_items(search_str, limit=10, provider=None, source=None):
     """
     get dict list with autocomplete
     """
     if xbmc.getCondVisibility("System.HasHiddenInput"):
         return []
 
-    setting = SETTING("autocomplete_provider").lower()
+    if source is None:
+        if xbmcgui.Window(10000).getProperty("AutoCompleteSource") == "library":
+            source = "library"
+        elif xbmc.getCondVisibility("Window.IsActive(addonbrowser)"):
+            source = "addons"
+    setting = source if source in ("library", "addons") else SETTING("autocomplete_provider").lower()
 
-    if setting == "youtube":
+    if setting == "library":
+        provider = LocalLibraryProvider(limit=limit)
+    elif setting == "addons":
+        provider = InstalledAddonsProvider(limit=limit)
+    elif setting == "youtube":
         provider = GoogleProvider(youtube=True, limit=limit)
     elif setting == "google":
         provider = GoogleProvider(limit=limit)
@@ -184,6 +196,142 @@ class LocalDictProvider(BaseProvider):
                     break
 
         return suggestions
+
+
+class InstalledAddonsProvider(BaseProvider):
+    """
+    Suggestions drawn from the names of the installed add-ons, used while searching
+    in the add-on browser. Matches at the start of the name or of any word within it.
+    """
+
+    # internal add-on types that never show up in the add-on browser
+    HIDDEN_TYPES = ("xbmc.python.module", "xbmc.python.library", "kodi.resource", "xbmc.addon.metadata")
+
+    def build_url(self, query):
+        return query
+
+    def fetch_data(self, search_str):
+        needle = search_str.strip().lower()
+        if not needle:
+            return []
+        query = {
+            "jsonrpc": "2.0", "id": 1, "method": "Addons.GetAddons",
+            "params": {"installed": True, "enabled": "all", "properties": ["name"]},
+        }
+        response = json.loads(xbmc.executeJSONRPC(json.dumps(query)))
+        found = {}
+        for addon in response.get("result", {}).get("addons") or []:
+            if addon.get("type", "").startswith(self.HIDDEN_TYPES):
+                continue
+            name = (addon.get("name") or "").strip()
+            key = name.lower()
+            if not name or key in found:
+                continue
+            words = key.split()
+            if key == needle:
+                tier = 0
+            elif key.startswith(needle):
+                tier = 1
+            elif any(" ".join(words[i:]).startswith(needle) for i in range(1, len(words))):
+                tier = 2
+            else:
+                continue
+            found[key] = (tier, key, name)
+        return [entry[2] for entry in sorted(found.values())]
+
+
+class LocalLibraryProvider(BaseProvider):
+    """
+    Suggestions drawn from the local video and music library only:
+    titles, performers (actors, directors, artists), albums and songs.
+    Matches at the start of the title or of any word within it.
+    """
+
+    # (script.globalsearch category setting, database prefix, table, column, extra condition);
+    # a source is only used while its category is enabled in Global Search, so
+    # suggestions never offer something that search would not find.
+    # Order is the tie-break between sources.
+    SOURCES = (
+        ("movies", "MyVideos", "movie", "c00", ""),
+        ("tvshows", "MyVideos", "tvshow", "c00", ""),
+        ("actors", "MyVideos", "actor", "name",
+         "actor_id IN (SELECT actor_id FROM actor_link WHERE media_type = 'movie')"),
+        ("tvactors", "MyVideos", "actor", "name",
+         "actor_id IN (SELECT actor_id FROM actor_link WHERE media_type = 'tvshow')"),
+        ("directors", "MyVideos", "actor", "name",
+         "actor_id IN (SELECT actor_id FROM director_link WHERE media_type = 'movie')"),
+        ("musicvideos", "MyVideos", "musicvideo", "c00", ""),
+        ("artists", "MyMusic", "artist", "strArtist", ""),
+        ("albums", "MyMusic", "album", "strAlbum", ""),
+        ("songs", "MyMusic", "song", "strTitle", ""),
+        ("episodes", "MyVideos", "episode", "c00", ""),
+    )
+    ROW_LIMIT = 30
+
+    def build_url(self, query):
+        return query
+
+    @staticmethod
+    def _db_path(prefix):
+        folder = xbmcvfs.translatePath("special://database")
+        best, best_version = None, -1
+        for name in os.listdir(folder):
+            match = re.fullmatch(prefix + r"(\d+)\.db", name)
+            if match and int(match.group(1)) > best_version:
+                best, best_version = name, int(match.group(1))
+        return os.path.join(folder, best) if best else None
+
+    @staticmethod
+    def _category_enabled(category):
+        try:
+            return xbmcaddon.Addon("script.globalsearch").getSettingBool(category)
+        except Exception:
+            return True
+
+    def fetch_data(self, search_str):
+        text = search_str.strip()
+        if not text:
+            return []
+        escaped = re.sub(r"([\\%_])", r"\\\1", text)
+        prefix_like, word_like = escaped + "%", "% " + escaped + "%"
+        needle = text.lower()
+        connections = {}
+        found = {}
+        try:
+            for rank, (category, db_prefix, table, column, condition) in enumerate(self.SOURCES):
+                if not self._category_enabled(category):
+                    continue
+                if db_prefix not in connections:
+                    path = self._db_path(db_prefix)
+                    connections[db_prefix] = (
+                        sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=1) if path else None
+                    )
+                con = connections[db_prefix]
+                if not con:
+                    continue
+                query = (
+                    "SELECT %(c)s FROM %(t)s WHERE (%(c)s LIKE ?1 ESCAPE '\\' OR %(c)s LIKE ?2 ESCAPE '\\') %(x)s "
+                    "ORDER BY %(c)s NOT LIKE ?1 ESCAPE '\\', %(c)s LIMIT %(n)d"
+                ) % {"c": column, "t": table, "x": "AND " + condition if condition else "", "n": self.ROW_LIMIT}
+                try:
+                    rows = con.execute(query, (prefix_like, word_like)).fetchall()
+                except sqlite3.Error as e:
+                    log("query on %s failed: %s" % (table, e))
+                    continue
+                for (label,) in rows:
+                    label = (label or "").strip()
+                    key = label.lower()
+                    if label and key not in found:
+                        # exact match, then whole-title prefix, then word-start matches
+                        tier = 0 if key == needle else 1 if key.startswith(needle) else 2
+                        found[key] = (tier, rank, key, label)
+        except sqlite3.Error as e:
+            log("could not open library database: %s" % e)
+        finally:
+            for con in connections.values():
+                if con:
+                    con.close()
+        return [entry[3] for entry in sorted(found.values())]
 
 
 def get_JSON_response(url="", cache_days=7.0, folder=False, headers=False):
